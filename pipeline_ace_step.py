@@ -55,7 +55,7 @@ REPO_ID = "ACE-Step/ACE-Step-v1-3.5B"
 # class ACEStepPipeline(DiffusionPipeline):
 class ACEStepPipeline:
 
-    def __init__(self, checkpoint_dir=None, device_id=0, dtype="bfloat16", text_encoder_checkpoint_path=None, persistent_storage_path=None, torch_compile=False, **kwargs):
+    def __init__(self, checkpoint_dir=None, device_id=0, dtype="bfloat16", text_encoder_checkpoint_path=None, persistent_storage_path=None, torch_compile=False, cpu_offload=False, **kwargs):
         if not checkpoint_dir:
             if persistent_storage_path is None:
                 checkpoint_dir = os.path.join(os.path.dirname(__file__), "checkpoints")
@@ -73,6 +73,7 @@ class ACEStepPipeline:
         self.device = device
         self.loaded = False
         self.torch_compile = torch_compile
+        self.cpu_offload = cpu_offload  # CPU 오프로드 옵션 추가
 
     def load_checkpoint(self, checkpoint_dir=None):
         device = self.device
@@ -81,6 +82,9 @@ class ACEStepPipeline:
         vocoder_model_path = os.path.join(checkpoint_dir, "music_vocoder")
         ace_step_model_path = os.path.join(checkpoint_dir, "ace_step_transformer")
         text_encoder_model_path = os.path.join(checkpoint_dir, "umt5-base")
+
+
+        model_device = torch.device("cpu") if self.cpu_offload else self.device
 
         files_exist = (
             os.path.exists(os.path.join(dcae_model_path, "config.json")) and
@@ -139,12 +143,19 @@ class ACEStepPipeline:
         vocoder_checkpoint_path = vocoder_model_path
         ace_step_checkpoint_path = ace_step_model_path
         text_encoder_checkpoint_path = text_encoder_model_path
-
+        """
         self.music_dcae = MusicDCAE(dcae_checkpoint_path=dcae_checkpoint_path, vocoder_checkpoint_path=vocoder_checkpoint_path)
         self.music_dcae.to(device).eval().to(self.dtype)
 
         self.ace_step_transformer = ACEStepTransformer2DModel.from_pretrained(ace_step_checkpoint_path, torch_dtype=self.dtype)
         self.ace_step_transformer.to(device).eval().to(self.dtype)
+        """
+        # 모델 로딩 시 CPU에 로드
+        self.music_dcae = MusicDCAE(dcae_checkpoint_path=dcae_model_path, vocoder_checkpoint_path=vocoder_model_path)
+        self.music_dcae.to(model_device).eval().to(self.dtype)
+
+        self.ace_step_transformer = ACEStepTransformer2DModel.from_pretrained(ace_step_model_path, torch_dtype=self.dtype)
+        self.ace_step_transformer.to(model_device).eval().to(self.dtype)
 
         lang_segment = LangSegment()
 
@@ -158,10 +169,19 @@ class ACEStepPipeline:
         ])
         self.lang_segment = lang_segment
         self.lyric_tokenizer = VoiceBpeTokenizer()
+        """
         text_encoder_model = UMT5EncoderModel.from_pretrained(text_encoder_checkpoint_path, torch_dtype=self.dtype).eval()
         text_encoder_model = text_encoder_model.to(device).to(self.dtype)
         text_encoder_model.requires_grad_(False)
         self.text_encoder_model = text_encoder_model
+        """
+
+        # 텍스트 인코더도 CPU에 로드
+        text_encoder_model = UMT5EncoderModel.from_pretrained(text_encoder_model_path, torch_dtype=self.dtype).eval()
+        text_encoder_model = text_encoder_model.to(model_device).to(self.dtype)
+        text_encoder_model.requires_grad_(False)
+        self.text_encoder_model = text_encoder_model
+
         self.text_tokenizer = AutoTokenizer.from_pretrained(text_encoder_checkpoint_path)
         self.loaded = True
 
@@ -170,7 +190,7 @@ class ACEStepPipeline:
             self.music_dcae = torch.compile(self.music_dcae)
             self.ace_step_transformer = torch.compile(self.ace_step_transformer)
             self.text_encoder_model = torch.compile(self.text_encoder_model)
-
+    """
     def get_text_embeddings(self, texts, device, text_max_length=256):
         inputs = self.text_tokenizer(texts, return_tensors="pt", padding=True, truncation=True, max_length=text_max_length)
         inputs = {key: value.to(device) for key, value in inputs.items()}
@@ -181,12 +201,37 @@ class ACEStepPipeline:
             last_hidden_states = outputs.last_hidden_state
         attention_mask = inputs["attention_mask"]
         return last_hidden_states, attention_mask
-    
+    """
+
+    def get_text_embeddings(self, texts, device, text_max_length=256):
+        inputs = self.text_tokenizer(texts, return_tensors="pt", padding=True, truncation=True, max_length=text_max_length)
+        inputs = {key: value.to(device) for key, value in inputs.items()}
+        
+        # CPU 오프로드 활성화된 경우 GPU로 이동
+        if self.cpu_offload:
+            self.text_encoder_model.to(device)
+        
+        with torch.no_grad():
+            outputs = self.text_encoder_model(**inputs)
+            last_hidden_states = outputs.last_hidden_state
+        
+        # 작업 후 다시 CPU로 이동 (메모리 절약)
+        if self.cpu_offload:
+            self.text_encoder_model.to("cpu")
+            torch.cuda.empty_cache()  # GPU 메모리 정리
+        
+        attention_mask = inputs["attention_mask"]
+        return last_hidden_states, attention_mask
+
+    #def get_text_embeddings_null(self, texts, device, text_max_length=256, tau=0.01, l_min=8, l_max=10):
     def get_text_embeddings_null(self, texts, device, text_max_length=256, tau=0.01, l_min=8, l_max=10):
         inputs = self.text_tokenizer(texts, return_tensors="pt", padding=True, truncation=True, max_length=text_max_length)
         inputs = {key: value.to(device) for key, value in inputs.items()}
         if self.text_encoder_model.device != device:
             self.text_encoder_model.to(device)
+        
+        #if self.cpu_offload:
+        #    self.text_encoder_model.to(device)            
         
         def forward_with_temperature(inputs, tau=0.01, l_min=8, l_max=10):
             handlers = []
@@ -209,6 +254,13 @@ class ACEStepPipeline:
             return last_hidden_states
     
         last_hidden_states = forward_with_temperature(inputs, tau, l_min, l_max)
+
+
+        if self.cpu_offload:
+            self.text_encoder_model.to("cpu")
+            torch.cuda.empty_cache()
+
+
         return last_hidden_states
 
     def set_seeds(self, batch_size, manual_seeds=None):
@@ -301,6 +353,11 @@ class ACEStepPipeline:
         momentum_buffer_tar=None,
         return_src_pred=True
     ):
+
+            # CPU 오프로드 활성화된 경우 GPU로 이동
+        if self.cpu_offload:
+            self.ace_step_transformer.to(self.device)
+
         noise_pred_src = None
         if return_src_pred:
             src_latent_model_input = torch.cat([zt_src, zt_src]) if do_classifier_free_guidance else zt_src
@@ -362,6 +419,12 @@ class ACEStepPipeline:
                     uncond_output=noise_pred_uncond_tar,
                     cfg_strength=target_guidance_scale,
                 )
+
+        # 작업 완료 후 다시 CPU로 이동
+        if self.cpu_offload:
+            self.ace_step_transformer.to("cpu")
+            torch.cuda.empty_cache()
+
         return noise_pred_src, noise_pred_tar
 
     @torch.no_grad()
@@ -554,6 +617,10 @@ class ACEStepPipeline:
         repaint_end=0,
         src_latents=None,
     ):
+
+
+        if self.cpu_offload:
+            self.ace_step_transformer.to(self.device)
 
         logger.info("cfg_type: {}, guidance_scale: {}, omega_scale: {}".format(cfg_type, guidance_scale, omega_scale))
         do_classifier_free_guidance = True
@@ -915,6 +982,11 @@ class ACEStepPipeline:
                 target_latents = torch.cate([target_latents, to_right_pad_gt_latents], dim=-1)
             if to_left_pad_gt_latents is not None:
                 target_latents = torch.cate([to_right_pad_gt_latents, target_latents], dim=0)
+
+        if self.cpu_offload:
+            self.ace_step_transformer.to("cpu")
+            torch.cuda.empty_cache()
+
         return target_latents
 
     def latents2audio(self, latents, target_wav_duration_second=30, sample_rate=48000, save_path=None, format="flac"):
@@ -922,12 +994,25 @@ class ACEStepPipeline:
         bs = latents.shape[0]
         audio_lengths = [target_wav_duration_second * sample_rate] * bs
         pred_latents = latents
+
+        if self.cpu_offload:
+            self.music_dcae.to(self.device)
+        
         with torch.no_grad():
             _, pred_wavs = self.music_dcae.decode(pred_latents, sr=sample_rate)
+
+        #with torch.no_grad():
+        #    _, pred_wavs = self.music_dcae.decode(pred_latents, sr=sample_rate)
         pred_wavs = [pred_wav.cpu().float() for pred_wav in pred_wavs]
         for i in tqdm(range(bs)):
             output_audio_path = self.save_wav_file(pred_wavs[i], i, sample_rate=sample_rate)
             output_audio_paths.append(output_audio_path)
+
+        # 작업 완료 후 다시 CPU로 이동
+        if self.cpu_offload:
+            self.music_dcae.to("cpu")
+            torch.cuda.empty_cache()
+
         return output_audio_paths
 
     def save_wav_file(self, target_wav, idx, save_path=None, sample_rate=48000, format="flac"):
@@ -947,12 +1032,22 @@ class ACEStepPipeline:
     def infer_latents(self, input_audio_path):
         if input_audio_path is None:
             return None
+
+        # CPU 오프로드 활성화된 경우 GPU로 이동
+        if self.cpu_offload:
+            self.music_dcae.to(self.device)
+
         input_audio, sr = self.music_dcae.load_audio(input_audio_path)
         input_audio = input_audio.unsqueeze(0)
         device, dtype = self.device, self.dtype
         input_audio = input_audio.to(device=device, dtype=dtype)
         latents, _ = self.music_dcae.encode(input_audio, sr=sr)
-        return latents
+
+        # 작업 완료 후 다시 CPU로 이동
+        if self.cpu_offload:
+            self.music_dcae.to("cpu")
+            torch.cuda.empty_cache()        
+            return latents
 
     def __call__(
         self,
@@ -989,9 +1084,14 @@ class ACEStepPipeline:
         format: str = "flac",
         batch_size: int = 1,
         debug: bool = False,
+        cpu_offload: bool = None,  # CPU 오프로드 옵션 파라미터 추가
     ):
 
         start_time = time.time()
+
+        # cpu_offload 파라미터가 전달된 경우 인스턴스 변수 업데이트
+        if cpu_offload is not None:
+            self.cpu_offload = cpu_offload
 
         if not self.loaded:
             logger.warning("Checkpoint not loaded, loading checkpoint...")
