@@ -24,7 +24,7 @@ from models.ace_step_transformer import ACEStepTransformer2DModel
 from models.lyrics_utils.lyric_tokenizer import VoiceBpeTokenizer
 from apg_guidance import apg_forward, MomentumBuffer, cfg_forward, cfg_zero_star, cfg_double_condition_forward
 import torchaudio
-
+from transformers import BitsAndBytesConfig
 
 torch.backends.cudnn.benchmark = False
 torch.set_float32_matmul_precision('high')
@@ -55,7 +55,7 @@ REPO_ID = "ACE-Step/ACE-Step-v1-3.5B"
 # class ACEStepPipeline(DiffusionPipeline):
 class ACEStepPipeline:
 
-    def __init__(self, checkpoint_dir=None, device_id=0, dtype="bfloat16", text_encoder_checkpoint_path=None, persistent_storage_path=None, torch_compile=False, cpu_offload=False, **kwargs):
+    def __init__(self, checkpoint_dir=None, device_id=0, dtype="bfloat16", text_encoder_checkpoint_path=None, persistent_storage_path=None, torch_compile=False, cpu_offload=True, load_in_4bit=True, **kwargs):
         if not checkpoint_dir:
             if persistent_storage_path is None:
                 checkpoint_dir = os.path.join(os.path.dirname(__file__), "checkpoints")
@@ -74,6 +74,7 @@ class ACEStepPipeline:
         self.loaded = False
         self.torch_compile = torch_compile
         self.cpu_offload = cpu_offload  # CPU 오프로드 옵션 추가
+        self.load_in_4bit = load_in_4bit  # Add the new parameter
 
     def load_checkpoint(self, checkpoint_dir=None):
         device = self.device
@@ -150,12 +151,31 @@ class ACEStepPipeline:
         self.ace_step_transformer = ACEStepTransformer2DModel.from_pretrained(ace_step_checkpoint_path, torch_dtype=self.dtype)
         self.ace_step_transformer.to(device).eval().to(self.dtype)
         """
+
+        quantization_config = None
+        if self.load_in_4bit:
+            quantization_config = BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_compute_dtype=self.dtype,
+                bnb_4bit_quant_type="nf4",
+                bnb_4bit_use_double_quant=True
+            )
+
+
         # 모델 로딩 시 CPU에 로드
         self.music_dcae = MusicDCAE(dcae_checkpoint_path=dcae_model_path, vocoder_checkpoint_path=vocoder_model_path)
         self.music_dcae.to(model_device).eval().to(self.dtype)
 
-        self.ace_step_transformer = ACEStepTransformer2DModel.from_pretrained(ace_step_model_path, torch_dtype=self.dtype)
-        self.ace_step_transformer.to(model_device).eval().to(self.dtype)
+        if self.load_in_4bit:
+            self.ace_step_transformer = ACEStepTransformer2DModel.from_pretrained(
+                ace_step_model_path, 
+                quantization_config=quantization_config,
+                device_map="auto" if not self.cpu_offload else None
+            )
+            self.ace_step_transformer.eval()
+        else:
+            self.ace_step_transformer = ACEStepTransformer2DModel.from_pretrained(ace_step_model_path, torch_dtype=self.dtype)
+            self.ace_step_transformer.to(model_device).eval().to(self.dtype)
 
         lang_segment = LangSegment()
 
@@ -177,8 +197,21 @@ class ACEStepPipeline:
         """
 
         # 텍스트 인코더도 CPU에 로드
-        text_encoder_model = UMT5EncoderModel.from_pretrained(text_encoder_model_path, torch_dtype=self.dtype).eval()
-        text_encoder_model = text_encoder_model.to(model_device).to(self.dtype)
+        # Load text encoder with 4-bit quantization if enabled
+        if self.load_in_4bit:
+            text_encoder_model = UMT5EncoderModel.from_pretrained(
+                text_encoder_model_path,
+                quantization_config=quantization_config,
+                device_map="auto" if not self.cpu_offload else None
+            )
+            text_encoder_model.eval()
+        else:
+            text_encoder_model = UMT5EncoderModel.from_pretrained(
+                text_encoder_model_path, 
+                torch_dtype=self.dtype
+            ).eval()
+            text_encoder_model = text_encoder_model.to(model_device).to(self.dtype)
+            
         text_encoder_model.requires_grad_(False)
         self.text_encoder_model = text_encoder_model
 
@@ -619,375 +652,377 @@ class ACEStepPipeline:
     ):
 
 
-        if self.cpu_offload:
-            self.ace_step_transformer.to(self.device)
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16): 
 
-        logger.info("cfg_type: {}, guidance_scale: {}, omega_scale: {}".format(cfg_type, guidance_scale, omega_scale))
-        do_classifier_free_guidance = True
-        if guidance_scale == 0.0 or guidance_scale == 1.0:
-            do_classifier_free_guidance = False
-        
-        do_double_condition_guidance = False
-        if guidance_scale_text is not None and guidance_scale_text > 1.0 and guidance_scale_lyric is not None and guidance_scale_lyric > 1.0:
-            do_double_condition_guidance = True
-            logger.info("do_double_condition_guidance: {}, guidance_scale_text: {}, guidance_scale_lyric: {}".format(do_double_condition_guidance, guidance_scale_text, guidance_scale_lyric))
+            if self.cpu_offload:
+                self.ace_step_transformer.to(self.device)
 
-        device = encoder_text_hidden_states.device
-        dtype = encoder_text_hidden_states.dtype
-        bsz = encoder_text_hidden_states.shape[0]
-
-        if scheduler_type == "euler":
-            scheduler = FlowMatchEulerDiscreteScheduler(
-                num_train_timesteps=1000,
-                shift=3.0,
-            )
-        elif scheduler_type == "heun":
-            scheduler = FlowMatchHeunDiscreteScheduler(
-                num_train_timesteps=1000,
-                shift=3.0,
-            )
-        
-        frame_length = int(duration * 44100 / 512 / 8)
-        if src_latents is not None:
-            frame_length = src_latents.shape[-1]
-
-        if len(oss_steps) > 0:
-            infer_steps = max(oss_steps)
-            scheduler.set_timesteps
-            timesteps, num_inference_steps = retrieve_timesteps(scheduler, num_inference_steps=infer_steps, device=device, timesteps=None)
-            new_timesteps = torch.zeros(len(oss_steps), dtype=dtype, device=device)
-            for idx in range(len(oss_steps)):
-                new_timesteps[idx] = timesteps[oss_steps[idx]-1]
-            num_inference_steps = len(oss_steps)
-            sigmas = (new_timesteps / 1000).float().cpu().numpy()
-            timesteps, num_inference_steps = retrieve_timesteps(scheduler, num_inference_steps=num_inference_steps, device=device, sigmas=sigmas)
-            logger.info(f"oss_steps: {oss_steps}, num_inference_steps: {num_inference_steps} after remapping to timesteps {timesteps}")
-        else:
-            timesteps, num_inference_steps = retrieve_timesteps(scheduler, num_inference_steps=infer_steps, device=device, timesteps=None)
-        
-        target_latents = randn_tensor(shape=(bsz, 8, 16, frame_length), generator=random_generators, device=device, dtype=dtype)
-        
-        is_repaint = False
-        is_extend  = False
-        if add_retake_noise:
-            n_min = int(infer_steps * (1 - retake_variance))
-            retake_variance = torch.tensor(retake_variance * math.pi/2).to(device).to(dtype)
-            retake_latents = randn_tensor(shape=(bsz, 8, 16, frame_length), generator=retake_random_generators, device=device, dtype=dtype)
-            repaint_start_frame = int(repaint_start * 44100 / 512 / 8)
-            repaint_end_frame = int(repaint_end * 44100 / 512 / 8)
-            x0 = src_latents
-            # retake
-            is_repaint = (repaint_end_frame - repaint_start_frame != frame_length) 
+            logger.info("cfg_type: {}, guidance_scale: {}, omega_scale: {}".format(cfg_type, guidance_scale, omega_scale))
+            do_classifier_free_guidance = True
+            if guidance_scale == 0.0 or guidance_scale == 1.0:
+                do_classifier_free_guidance = False
             
-            is_extend = (repaint_start_frame < 0) or (repaint_end_frame > frame_length)
-            if is_extend:
-                is_repaint = True
+            do_double_condition_guidance = False
+            if guidance_scale_text is not None and guidance_scale_text > 1.0 and guidance_scale_lyric is not None and guidance_scale_lyric > 1.0:
+                do_double_condition_guidance = True
+                logger.info("do_double_condition_guidance: {}, guidance_scale_text: {}, guidance_scale_lyric: {}".format(do_double_condition_guidance, guidance_scale_text, guidance_scale_lyric))
 
-            # TODO: train a mask aware repainting controlnet
-            # to make sure mean = 0, std = 1
-            if not is_repaint:
-                target_latents = torch.cos(retake_variance) * target_latents + torch.sin(retake_variance) * retake_latents
-            elif not is_extend:
-                # if repaint_end_frame 
-                repaint_mask = torch.zeros((bsz, 8, 16, frame_length), device=device, dtype=dtype)
-                repaint_mask[:, :, :, repaint_start_frame:repaint_end_frame] = 1.0
-                repaint_noise = torch.cos(retake_variance) * target_latents + torch.sin(retake_variance) * retake_latents
-                repaint_noise = torch.where(repaint_mask == 1.0, repaint_noise, target_latents)
-                zt_edit = x0.clone()
-                z0 = repaint_noise
-            elif is_extend:
-                to_right_pad_gt_latents = None
-                to_left_pad_gt_latents = None
-                gt_latents = src_latents
-                src_latents_length = gt_latents.shape[-1]
-                max_infer_fame_length = int(240 * 44100 / 512 / 8)
-                left_pad_frame_length = 0
-                right_pad_frame_length = 0
-                right_trim_length = 0
-                left_trim_length = 0
-                if repaint_start_frame < 0:
-                    left_pad_frame_length = abs(repaint_start_frame)
-                    frame_length = left_pad_frame_length + gt_latents.shape[-1]
-                    extend_gt_latents = torch.nn.functional.pad(gt_latents, (left_pad_frame_length, 0), "constant", 0)
-                    if frame_length > max_infer_fame_length:
-                        right_trim_length = frame_length - max_infer_fame_length
-                        extend_gt_latents = extend_gt_latents[:,:,:,:max_infer_fame_length]
-                        to_right_pad_gt_latents = extend_gt_latents[:,:,:,-right_trim_length:]
-                        frame_length = max_infer_fame_length
-                    repaint_start_frame = 0
-                    gt_latents = extend_gt_latents
+            device = encoder_text_hidden_states.device
+            dtype = encoder_text_hidden_states.dtype
+            bsz = encoder_text_hidden_states.shape[0]
+
+            if scheduler_type == "euler":
+                scheduler = FlowMatchEulerDiscreteScheduler(
+                    num_train_timesteps=1000,
+                    shift=3.0,
+                )
+            elif scheduler_type == "heun":
+                scheduler = FlowMatchHeunDiscreteScheduler(
+                    num_train_timesteps=1000,
+                    shift=3.0,
+                )
+            
+            frame_length = int(duration * 44100 / 512 / 8)
+            if src_latents is not None:
+                frame_length = src_latents.shape[-1]
+
+            if len(oss_steps) > 0:
+                infer_steps = max(oss_steps)
+                scheduler.set_timesteps
+                timesteps, num_inference_steps = retrieve_timesteps(scheduler, num_inference_steps=infer_steps, device=device, timesteps=None)
+                new_timesteps = torch.zeros(len(oss_steps), dtype=dtype, device=device)
+                for idx in range(len(oss_steps)):
+                    new_timesteps[idx] = timesteps[oss_steps[idx]-1]
+                num_inference_steps = len(oss_steps)
+                sigmas = (new_timesteps / 1000).float().cpu().numpy()
+                timesteps, num_inference_steps = retrieve_timesteps(scheduler, num_inference_steps=num_inference_steps, device=device, sigmas=sigmas)
+                logger.info(f"oss_steps: {oss_steps}, num_inference_steps: {num_inference_steps} after remapping to timesteps {timesteps}")
+            else:
+                timesteps, num_inference_steps = retrieve_timesteps(scheduler, num_inference_steps=infer_steps, device=device, timesteps=None)
+            
+            target_latents = randn_tensor(shape=(bsz, 8, 16, frame_length), generator=random_generators, device=device, dtype=dtype)
+            
+            is_repaint = False
+            is_extend  = False
+            if add_retake_noise:
+                n_min = int(infer_steps * (1 - retake_variance))
+                retake_variance = torch.tensor(retake_variance * math.pi/2).to(device).to(dtype)
+                retake_latents = randn_tensor(shape=(bsz, 8, 16, frame_length), generator=retake_random_generators, device=device, dtype=dtype)
+                repaint_start_frame = int(repaint_start * 44100 / 512 / 8)
+                repaint_end_frame = int(repaint_end * 44100 / 512 / 8)
+                x0 = src_latents
+                # retake
+                is_repaint = (repaint_end_frame - repaint_start_frame != frame_length) 
                 
-                if repaint_end_frame > src_latents_length:
-                    right_pad_frame_length = repaint_end_frame - gt_latents.shape[-1]
-                    frame_length = gt_latents.shape[-1] + right_pad_frame_length
-                    extend_gt_latents = torch.nn.functional.pad(gt_latents, (0, right_pad_frame_length), "constant", 0)
-                    if frame_length > max_infer_fame_length:
-                        left_trim_length = frame_length - max_infer_fame_length
-                        extend_gt_latents = extend_gt_latents[:,:,:,-max_infer_fame_length:]
-                        to_left_pad_gt_latents = extend_gt_latents[:,:,:,:left_trim_length]
-                        frame_length = max_infer_fame_length
-                    repaint_end_frame = frame_length
-                    gt_latents = extend_gt_latents
+                is_extend = (repaint_start_frame < 0) or (repaint_end_frame > frame_length)
+                if is_extend:
+                    is_repaint = True
 
-                repaint_mask = torch.zeros((bsz, 8, 16, frame_length), device=device, dtype=dtype)
-                if left_pad_frame_length > 0:
-                    repaint_mask[:,:,:,:left_pad_frame_length] = 1.0
-                if right_pad_frame_length > 0:
-                    repaint_mask[:,:,:,-right_pad_frame_length:] = 1.0
-                x0 = gt_latents
-                padd_list = []
-                if left_pad_frame_length > 0:
-                    padd_list.append(retake_latents[:, :, :, :left_pad_frame_length])
-                padd_list.append(target_latents[:,:,:,left_trim_length:target_latents.shape[-1]-right_trim_length])
-                if right_pad_frame_length > 0:
-                    padd_list.append(retake_latents[:, :, :, -right_pad_frame_length:])
-                target_latents = torch.cat(padd_list, dim=-1)
-                assert target_latents.shape[-1] == x0.shape[-1], f"{target_latents.shape=} {x0.shape=}"
-                zt_edit = x0.clone()
-                z0 = target_latents
+                # TODO: train a mask aware repainting controlnet
+                # to make sure mean = 0, std = 1
+                if not is_repaint:
+                    target_latents = torch.cos(retake_variance) * target_latents + torch.sin(retake_variance) * retake_latents
+                elif not is_extend:
+                    # if repaint_end_frame 
+                    repaint_mask = torch.zeros((bsz, 8, 16, frame_length), device=device, dtype=dtype)
+                    repaint_mask[:, :, :, repaint_start_frame:repaint_end_frame] = 1.0
+                    repaint_noise = torch.cos(retake_variance) * target_latents + torch.sin(retake_variance) * retake_latents
+                    repaint_noise = torch.where(repaint_mask == 1.0, repaint_noise, target_latents)
+                    zt_edit = x0.clone()
+                    z0 = repaint_noise
+                elif is_extend:
+                    to_right_pad_gt_latents = None
+                    to_left_pad_gt_latents = None
+                    gt_latents = src_latents
+                    src_latents_length = gt_latents.shape[-1]
+                    max_infer_fame_length = int(240 * 44100 / 512 / 8)
+                    left_pad_frame_length = 0
+                    right_pad_frame_length = 0
+                    right_trim_length = 0
+                    left_trim_length = 0
+                    if repaint_start_frame < 0:
+                        left_pad_frame_length = abs(repaint_start_frame)
+                        frame_length = left_pad_frame_length + gt_latents.shape[-1]
+                        extend_gt_latents = torch.nn.functional.pad(gt_latents, (left_pad_frame_length, 0), "constant", 0)
+                        if frame_length > max_infer_fame_length:
+                            right_trim_length = frame_length - max_infer_fame_length
+                            extend_gt_latents = extend_gt_latents[:,:,:,:max_infer_fame_length]
+                            to_right_pad_gt_latents = extend_gt_latents[:,:,:,-right_trim_length:]
+                            frame_length = max_infer_fame_length
+                        repaint_start_frame = 0
+                        gt_latents = extend_gt_latents
+                    
+                    if repaint_end_frame > src_latents_length:
+                        right_pad_frame_length = repaint_end_frame - gt_latents.shape[-1]
+                        frame_length = gt_latents.shape[-1] + right_pad_frame_length
+                        extend_gt_latents = torch.nn.functional.pad(gt_latents, (0, right_pad_frame_length), "constant", 0)
+                        if frame_length > max_infer_fame_length:
+                            left_trim_length = frame_length - max_infer_fame_length
+                            extend_gt_latents = extend_gt_latents[:,:,:,-max_infer_fame_length:]
+                            to_left_pad_gt_latents = extend_gt_latents[:,:,:,:left_trim_length]
+                            frame_length = max_infer_fame_length
+                        repaint_end_frame = frame_length
+                        gt_latents = extend_gt_latents
 
-        attention_mask = torch.ones(bsz, frame_length, device=device, dtype=dtype)
-        
-        # guidance interval
-        start_idx = int(num_inference_steps * ((1 - guidance_interval) / 2))
-        end_idx = int(num_inference_steps * (guidance_interval / 2 + 0.5))
-        logger.info(f"start_idx: {start_idx}, end_idx: {end_idx}, num_inference_steps: {num_inference_steps}")
+                    repaint_mask = torch.zeros((bsz, 8, 16, frame_length), device=device, dtype=dtype)
+                    if left_pad_frame_length > 0:
+                        repaint_mask[:,:,:,:left_pad_frame_length] = 1.0
+                    if right_pad_frame_length > 0:
+                        repaint_mask[:,:,:,-right_pad_frame_length:] = 1.0
+                    x0 = gt_latents
+                    padd_list = []
+                    if left_pad_frame_length > 0:
+                        padd_list.append(retake_latents[:, :, :, :left_pad_frame_length])
+                    padd_list.append(target_latents[:,:,:,left_trim_length:target_latents.shape[-1]-right_trim_length])
+                    if right_pad_frame_length > 0:
+                        padd_list.append(retake_latents[:, :, :, -right_pad_frame_length:])
+                    target_latents = torch.cat(padd_list, dim=-1)
+                    assert target_latents.shape[-1] == x0.shape[-1], f"{target_latents.shape=} {x0.shape=}"
+                    zt_edit = x0.clone()
+                    z0 = target_latents
 
-        momentum_buffer = MomentumBuffer()
-
-        def forward_encoder_with_temperature(self, inputs, tau=0.01, l_min=4, l_max=6):
-            handlers = []
+            attention_mask = torch.ones(bsz, frame_length, device=device, dtype=dtype)
             
-            def hook(module, input, output):
-                output[:] *= tau
-                return output
-            
-            for i in range(l_min, l_max):
-                handler = self.ace_step_transformer.lyric_encoder.encoders[i].self_attn.linear_q.register_forward_hook(hook)
-                handlers.append(handler)
-        
-            encoder_hidden_states, encoder_hidden_mask = self.ace_step_transformer.encode(**inputs)
-            
-            for hook in handlers:
-                hook.remove()
-            
-            return encoder_hidden_states
+            # guidance interval
+            start_idx = int(num_inference_steps * ((1 - guidance_interval) / 2))
+            end_idx = int(num_inference_steps * (guidance_interval / 2 + 0.5))
+            logger.info(f"start_idx: {start_idx}, end_idx: {end_idx}, num_inference_steps: {num_inference_steps}")
 
-        # P(speaker, text, lyric)
-        encoder_hidden_states, encoder_hidden_mask = self.ace_step_transformer.encode(
-            encoder_text_hidden_states,
-            text_attention_mask,
-            speaker_embds,
-            lyric_token_ids,
-            lyric_mask,
-        )
+            momentum_buffer = MomentumBuffer()
 
-        if use_erg_lyric:
-            # P(null_speaker, text_weaker, lyric_weaker)
-            encoder_hidden_states_null = forward_encoder_with_temperature(
-                self,
-                inputs={
-                    "encoder_text_hidden_states": encoder_text_hidden_states_null if encoder_text_hidden_states_null is not None else torch.zeros_like(encoder_text_hidden_states),
-                    "text_attention_mask": text_attention_mask,
-                    "speaker_embeds": torch.zeros_like(speaker_embds),
-                    "lyric_token_idx": lyric_token_ids,
-                    "lyric_mask": lyric_mask,
-                }
-            )
-        else:
-            # P(null_speaker, null_text, null_lyric)
-            encoder_hidden_states_null, _ = self.ace_step_transformer.encode(
-                torch.zeros_like(encoder_text_hidden_states),
+            def forward_encoder_with_temperature(self, inputs, tau=0.01, l_min=4, l_max=6):
+                handlers = []
+                
+                def hook(module, input, output):
+                    output[:] *= tau
+                    return output
+                
+                for i in range(l_min, l_max):
+                    handler = self.ace_step_transformer.lyric_encoder.encoders[i].self_attn.linear_q.register_forward_hook(hook)
+                    handlers.append(handler)
+            
+                encoder_hidden_states, encoder_hidden_mask = self.ace_step_transformer.encode(**inputs)
+                
+                for hook in handlers:
+                    hook.remove()
+                
+                return encoder_hidden_states
+
+            # P(speaker, text, lyric)
+            encoder_hidden_states, encoder_hidden_mask = self.ace_step_transformer.encode(
+                encoder_text_hidden_states,
                 text_attention_mask,
-                torch.zeros_like(speaker_embds),
-                torch.zeros_like(lyric_token_ids),
+                speaker_embds,
+                lyric_token_ids,
                 lyric_mask,
             )
-        
-        encoder_hidden_states_no_lyric = None
-        if do_double_condition_guidance:
-            # P(null_speaker, text, lyric_weaker)
+
             if use_erg_lyric:
-                encoder_hidden_states_no_lyric = forward_encoder_with_temperature(
+                # P(null_speaker, text_weaker, lyric_weaker)
+                encoder_hidden_states_null = forward_encoder_with_temperature(
                     self,
                     inputs={
-                        "encoder_text_hidden_states": encoder_text_hidden_states,
+                        "encoder_text_hidden_states": encoder_text_hidden_states_null if encoder_text_hidden_states_null is not None else torch.zeros_like(encoder_text_hidden_states),
                         "text_attention_mask": text_attention_mask,
                         "speaker_embeds": torch.zeros_like(speaker_embds),
                         "lyric_token_idx": lyric_token_ids,
                         "lyric_mask": lyric_mask,
                     }
                 )
-            # P(null_speaker, text, no_lyric)
             else:
-                encoder_hidden_states_no_lyric, _ = self.ace_step_transformer.encode(
-                    encoder_text_hidden_states,
+                # P(null_speaker, null_text, null_lyric)
+                encoder_hidden_states_null, _ = self.ace_step_transformer.encode(
+                    torch.zeros_like(encoder_text_hidden_states),
                     text_attention_mask,
                     torch.zeros_like(speaker_embds),
                     torch.zeros_like(lyric_token_ids),
                     lyric_mask,
                 )
-
-        def forward_diffusion_with_temperature(self, hidden_states, timestep, inputs, tau=0.01, l_min=15, l_max=20):
-            handlers = []
             
-            def hook(module, input, output):
-                output[:] *= tau
-                return output
-            
-            for i in range(l_min, l_max):
-                handler = self.ace_step_transformer.transformer_blocks[i].attn.to_q.register_forward_hook(hook)
-                handlers.append(handler)
-                handler = self.ace_step_transformer.transformer_blocks[i].cross_attn.to_q.register_forward_hook(hook)
-                handlers.append(handler)
-
-            sample = self.ace_step_transformer.decode(hidden_states=hidden_states, timestep=timestep, **inputs).sample
-            
-            for hook in handlers:
-                hook.remove()
-            
-            return sample
-    
-        for i, t in tqdm(enumerate(timesteps), total=num_inference_steps):
-            
-            if is_repaint:
-                if i < n_min:
-                    continue
-                elif i == n_min:
-                    t_i = t / 1000
-                    zt_src = (1 - t_i) * x0 + (t_i) * z0
-                    target_latents = zt_edit + zt_src - x0
-                    logger.info(f"repaint start from {n_min} add {t_i} level of noise")
-
-            # expand the latents if we are doing classifier free guidance
-            latents = target_latents
-
-            is_in_guidance_interval = start_idx <= i < end_idx
-            if is_in_guidance_interval and do_classifier_free_guidance:
-                # compute current guidance scale
-                if guidance_interval_decay > 0:
-                    # Linearly interpolate to calculate the current guidance scale
-                    progress = (i - start_idx) / (end_idx - start_idx - 1)  # 归一化到[0,1]
-                    current_guidance_scale = guidance_scale - (guidance_scale - min_guidance_scale) * progress * guidance_interval_decay
-                else:
-                    current_guidance_scale = guidance_scale
-
-                latent_model_input = latents
-                timestep = t.expand(latent_model_input.shape[0])
-                output_length = latent_model_input.shape[-1]
-                # P(x|speaker, text, lyric)
-                noise_pred_with_cond = self.ace_step_transformer.decode(
-                    hidden_states=latent_model_input,
-                    attention_mask=attention_mask,
-                    encoder_hidden_states=encoder_hidden_states,
-                    encoder_hidden_mask=encoder_hidden_mask,
-                    output_length=output_length,
-                    timestep=timestep,
-                ).sample
-
-                noise_pred_with_only_text_cond = None
-                if do_double_condition_guidance and encoder_hidden_states_no_lyric is not None:
-                    noise_pred_with_only_text_cond = self.ace_step_transformer.decode(
-                        hidden_states=latent_model_input,
-                        attention_mask=attention_mask,
-                        encoder_hidden_states=encoder_hidden_states_no_lyric,
-                        encoder_hidden_mask=encoder_hidden_mask,
-                        output_length=output_length,
-                        timestep=timestep,
-                    ).sample
-
-                if use_erg_diffusion:
-                    noise_pred_uncond = forward_diffusion_with_temperature(
+            encoder_hidden_states_no_lyric = None
+            if do_double_condition_guidance:
+                # P(null_speaker, text, lyric_weaker)
+                if use_erg_lyric:
+                    encoder_hidden_states_no_lyric = forward_encoder_with_temperature(
                         self,
-                        hidden_states=latent_model_input,
-                        timestep=timestep,
                         inputs={
-                            "encoder_hidden_states": encoder_hidden_states_null,
-                            "encoder_hidden_mask": encoder_hidden_mask,
-                            "output_length": output_length,
-                            "attention_mask": attention_mask,
-                        },
+                            "encoder_text_hidden_states": encoder_text_hidden_states,
+                            "text_attention_mask": text_attention_mask,
+                            "speaker_embeds": torch.zeros_like(speaker_embds),
+                            "lyric_token_idx": lyric_token_ids,
+                            "lyric_mask": lyric_mask,
+                        }
                     )
+                # P(null_speaker, text, no_lyric)
                 else:
-                    noise_pred_uncond = self.ace_step_transformer.decode(
+                    encoder_hidden_states_no_lyric, _ = self.ace_step_transformer.encode(
+                        encoder_text_hidden_states,
+                        text_attention_mask,
+                        torch.zeros_like(speaker_embds),
+                        torch.zeros_like(lyric_token_ids),
+                        lyric_mask,
+                    )
+
+            def forward_diffusion_with_temperature(self, hidden_states, timestep, inputs, tau=0.01, l_min=15, l_max=20):
+                handlers = []
+                
+                def hook(module, input, output):
+                    output[:] *= tau
+                    return output
+                
+                for i in range(l_min, l_max):
+                    handler = self.ace_step_transformer.transformer_blocks[i].attn.to_q.register_forward_hook(hook)
+                    handlers.append(handler)
+                    handler = self.ace_step_transformer.transformer_blocks[i].cross_attn.to_q.register_forward_hook(hook)
+                    handlers.append(handler)
+
+                sample = self.ace_step_transformer.decode(hidden_states=hidden_states, timestep=timestep, **inputs).sample
+                
+                for hook in handlers:
+                    hook.remove()
+                
+                return sample
+        
+            for i, t in tqdm(enumerate(timesteps), total=num_inference_steps):
+                
+                if is_repaint:
+                    if i < n_min:
+                        continue
+                    elif i == n_min:
+                        t_i = t / 1000
+                        zt_src = (1 - t_i) * x0 + (t_i) * z0
+                        target_latents = zt_edit + zt_src - x0
+                        logger.info(f"repaint start from {n_min} add {t_i} level of noise")
+
+                # expand the latents if we are doing classifier free guidance
+                latents = target_latents
+
+                is_in_guidance_interval = start_idx <= i < end_idx
+                if is_in_guidance_interval and do_classifier_free_guidance:
+                    # compute current guidance scale
+                    if guidance_interval_decay > 0:
+                        # Linearly interpolate to calculate the current guidance scale
+                        progress = (i - start_idx) / (end_idx - start_idx - 1)  # 归一化到[0,1]
+                        current_guidance_scale = guidance_scale - (guidance_scale - min_guidance_scale) * progress * guidance_interval_decay
+                    else:
+                        current_guidance_scale = guidance_scale
+
+                    latent_model_input = latents
+                    timestep = t.expand(latent_model_input.shape[0])
+                    output_length = latent_model_input.shape[-1]
+                    # P(x|speaker, text, lyric)
+                    noise_pred_with_cond = self.ace_step_transformer.decode(
                         hidden_states=latent_model_input,
                         attention_mask=attention_mask,
-                        encoder_hidden_states=encoder_hidden_states_null,
+                        encoder_hidden_states=encoder_hidden_states,
                         encoder_hidden_mask=encoder_hidden_mask,
                         output_length=output_length,
                         timestep=timestep,
                     ).sample
 
-                if do_double_condition_guidance and noise_pred_with_only_text_cond is not None:
-                    noise_pred = cfg_double_condition_forward(
-                        cond_output=noise_pred_with_cond,
-                        uncond_output=noise_pred_uncond,
-                        only_text_cond_output=noise_pred_with_only_text_cond,
-                        guidance_scale_text=guidance_scale_text,
-                        guidance_scale_lyric=guidance_scale_lyric,
-                    )
+                    noise_pred_with_only_text_cond = None
+                    if do_double_condition_guidance and encoder_hidden_states_no_lyric is not None:
+                        noise_pred_with_only_text_cond = self.ace_step_transformer.decode(
+                            hidden_states=latent_model_input,
+                            attention_mask=attention_mask,
+                            encoder_hidden_states=encoder_hidden_states_no_lyric,
+                            encoder_hidden_mask=encoder_hidden_mask,
+                            output_length=output_length,
+                            timestep=timestep,
+                        ).sample
 
-                elif cfg_type == "apg":
-                    noise_pred = apg_forward(
-                        pred_cond=noise_pred_with_cond,
-                        pred_uncond=noise_pred_uncond,
-                        guidance_scale=current_guidance_scale,
-                        momentum_buffer=momentum_buffer,
-                    )
-                elif cfg_type == "cfg":
-                    noise_pred = cfg_forward(
-                        cond_output=noise_pred_with_cond,
-                        uncond_output=noise_pred_uncond,
-                        cfg_strength=current_guidance_scale,
-                    )
-                elif cfg_type == "cfg_star":
-                    noise_pred = cfg_zero_star(
-                        noise_pred_with_cond=noise_pred_with_cond,
-                        noise_pred_uncond=noise_pred_uncond,
-                        guidance_scale=current_guidance_scale,
-                        i=i,
-                        zero_steps=zero_steps,
-                        use_zero_init=use_zero_init
-                    )
-            else:
-                latent_model_input = latents
-                timestep = t.expand(latent_model_input.shape[0])
-                noise_pred = self.ace_step_transformer.decode(
-                    hidden_states=latent_model_input,
-                    attention_mask=attention_mask,
-                    encoder_hidden_states=encoder_hidden_states,
-                    encoder_hidden_mask=encoder_hidden_mask,
-                    output_length=latent_model_input.shape[-1],
-                    timestep=timestep,
-                ).sample
+                    if use_erg_diffusion:
+                        noise_pred_uncond = forward_diffusion_with_temperature(
+                            self,
+                            hidden_states=latent_model_input,
+                            timestep=timestep,
+                            inputs={
+                                "encoder_hidden_states": encoder_hidden_states_null,
+                                "encoder_hidden_mask": encoder_hidden_mask,
+                                "output_length": output_length,
+                                "attention_mask": attention_mask,
+                            },
+                        )
+                    else:
+                        noise_pred_uncond = self.ace_step_transformer.decode(
+                            hidden_states=latent_model_input,
+                            attention_mask=attention_mask,
+                            encoder_hidden_states=encoder_hidden_states_null,
+                            encoder_hidden_mask=encoder_hidden_mask,
+                            output_length=output_length,
+                            timestep=timestep,
+                        ).sample
 
-            if is_repaint and i >= n_min:
-                t_i = t/1000
-                if i+1 < len(timesteps): 
-                    t_im1 = (timesteps[i+1])/1000
+                    if do_double_condition_guidance and noise_pred_with_only_text_cond is not None:
+                        noise_pred = cfg_double_condition_forward(
+                            cond_output=noise_pred_with_cond,
+                            uncond_output=noise_pred_uncond,
+                            only_text_cond_output=noise_pred_with_only_text_cond,
+                            guidance_scale_text=guidance_scale_text,
+                            guidance_scale_lyric=guidance_scale_lyric,
+                        )
+
+                    elif cfg_type == "apg":
+                        noise_pred = apg_forward(
+                            pred_cond=noise_pred_with_cond,
+                            pred_uncond=noise_pred_uncond,
+                            guidance_scale=current_guidance_scale,
+                            momentum_buffer=momentum_buffer,
+                        )
+                    elif cfg_type == "cfg":
+                        noise_pred = cfg_forward(
+                            cond_output=noise_pred_with_cond,
+                            uncond_output=noise_pred_uncond,
+                            cfg_strength=current_guidance_scale,
+                        )
+                    elif cfg_type == "cfg_star":
+                        noise_pred = cfg_zero_star(
+                            noise_pred_with_cond=noise_pred_with_cond,
+                            noise_pred_uncond=noise_pred_uncond,
+                            guidance_scale=current_guidance_scale,
+                            i=i,
+                            zero_steps=zero_steps,
+                            use_zero_init=use_zero_init
+                        )
                 else:
-                    t_im1 = torch.zeros_like(t_i).to(t_i.device)
-                dtype = noise_pred.dtype
-                target_latents = target_latents.to(torch.float32)
-                prev_sample = target_latents + (t_im1 - t_i) * noise_pred
-                prev_sample = prev_sample.to(dtype)
-                target_latents = prev_sample
-                zt_src = (1 - t_im1) * x0 + (t_im1) * z0
-                target_latents = torch.where(repaint_mask == 1.0, target_latents, zt_src)
-            else:
-                target_latents = scheduler.step(model_output=noise_pred, timestep=t, sample=target_latents, return_dict=False, omega=omega_scale)[0]
+                    latent_model_input = latents
+                    timestep = t.expand(latent_model_input.shape[0])
+                    noise_pred = self.ace_step_transformer.decode(
+                        hidden_states=latent_model_input,
+                        attention_mask=attention_mask,
+                        encoder_hidden_states=encoder_hidden_states,
+                        encoder_hidden_mask=encoder_hidden_mask,
+                        output_length=latent_model_input.shape[-1],
+                        timestep=timestep,
+                    ).sample
 
-        if is_extend:
-            if to_right_pad_gt_latents is not None:
-                target_latents = torch.cate([target_latents, to_right_pad_gt_latents], dim=-1)
-            if to_left_pad_gt_latents is not None:
-                target_latents = torch.cate([to_right_pad_gt_latents, target_latents], dim=0)
+                if is_repaint and i >= n_min:
+                    t_i = t/1000
+                    if i+1 < len(timesteps): 
+                        t_im1 = (timesteps[i+1])/1000
+                    else:
+                        t_im1 = torch.zeros_like(t_i).to(t_i.device)
+                    dtype = noise_pred.dtype
+                    target_latents = target_latents.to(torch.float32)
+                    prev_sample = target_latents + (t_im1 - t_i) * noise_pred
+                    prev_sample = prev_sample.to(dtype)
+                    target_latents = prev_sample
+                    zt_src = (1 - t_im1) * x0 + (t_im1) * z0
+                    target_latents = torch.where(repaint_mask == 1.0, target_latents, zt_src)
+                else:
+                    target_latents = scheduler.step(model_output=noise_pred, timestep=t, sample=target_latents, return_dict=False, omega=omega_scale)[0]
 
-        if self.cpu_offload:
-            self.ace_step_transformer.to("cpu")
-            torch.cuda.empty_cache()
+            if is_extend:
+                if to_right_pad_gt_latents is not None:
+                    target_latents = torch.cate([target_latents, to_right_pad_gt_latents], dim=-1)
+                if to_left_pad_gt_latents is not None:
+                    target_latents = torch.cate([to_right_pad_gt_latents, target_latents], dim=0)
 
-        return target_latents
+            if self.cpu_offload:
+                self.ace_step_transformer.to("cpu")
+                torch.cuda.empty_cache()
+
+            return target_latents
 
     def latents2audio(self, latents, target_wav_duration_second=30, sample_rate=48000, save_path=None, format="flac"):
         output_audio_paths = []
@@ -1221,12 +1256,13 @@ class ACEStepPipeline:
         diffusion_time_cost = end_time - start_time
         start_time = end_time
 
-        output_paths = self.latents2audio(
-            latents=target_latents,
-            target_wav_duration_second=audio_duration,
-            save_path=save_path,
-            format=format,
-        )
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16): 
+            output_paths = self.latents2audio(
+                latents=target_latents,
+                target_wav_duration_second=audio_duration,
+                save_path=save_path,
+                format=format,
+            )
 
         end_time = time.time()
         latent2audio_time_cost = end_time - start_time
